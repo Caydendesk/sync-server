@@ -44,10 +44,22 @@ function stripTags(s) {
   return (s || '').replace(/<[^>]+>/g, '').replace(/&[a-z]+;/gi, ' ').replace(/\s+/g, ' ').trim();
 }
 
-// 带超时与桌面 UA 的抓取
-async function fetchText(url) {
+// 全局节流 + 短时缓存：避免对 DDG 突发并行请求触发限流（数据中心 IP 易被拦）
+const _newsCache = new Map();
+const NEWS_CACHE_TTL = 90000;
+let _lastOutbound = 0;
+const MIN_GAP_MS = 600;
+function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
+async function throttle() {
+  const wait = MIN_GAP_MS - (Date.now() - _lastOutbound);
+  if (wait > 0) await sleep(wait);
+  _lastOutbound = Date.now();
+}
+
+// 带超时与桌面 UA 的抓取（timeout 可覆盖，百度用更短超时快速放弃）
+async function fetchText(url, timeoutMs) {
   const ctrl = new AbortController();
-  const timer = setTimeout(() => ctrl.abort(), 8000);
+  const timer = setTimeout(() => ctrl.abort(), timeoutMs || 8000);
   try {
     const r = await fetch(url, {
       headers: {
@@ -126,39 +138,47 @@ function parseDDG(html) {
   return titles;
 }
 
-// 单条查询：DuckDuckGo 为稳定可用的公开搜索（聚合 Bing/Yahoo 索引），Bing/Baidu 作尽力兜底
-// 注：Baidu 会拦截服务器 IP（超时）；Bing 结果页为 JS 渲染，静态抓取常为空；故 DDG 优先
+// 单条查询：DuckDuckGo 优先（html + lite 两个接口兜底），Bing/Baidu 作尽力兜底
+// 注：Baidu 拦截服务器 IP（超时）；Bing 结果页 JS 渲染常为空；DDG 聚合 Bing/Yahoo 索引最稳
 async function fetchSearch(query) {
+  const cacheKey = 'q:' + query;
+  const cached = _newsCache.get(cacheKey);
+  if (cached && (Date.now() - cached.t) < NEWS_CACHE_TTL) return cached.items;
   const sources = [
     { name: 'DuckDuckGo',      url: 'https://html.duckduckgo.com/html/?q=' + encodeURIComponent(query),        parse: parseDDG },
     { name: 'DuckDuckGo Lite', url: 'https://lite.duckduckgo.com/lite/?q=' + encodeURIComponent(query),        parse: parseDDG },
     { name: 'Bing',            url: 'https://www.bing.com/search?q=' + encodeURIComponent(query) + '&setlang=zh-CN&cc=CN', parse: parseBing },
-    { name: 'Baidu',           url: 'https://www.baidu.com/s?wd=' + encodeURIComponent(query),                  parse: parseBaidu }
+    { name: 'Baidu',           url: 'https://www.baidu.com/s?wd=' + encodeURIComponent(query),                 parse: parseBaidu, timeout: 5000 }
   ];
+  let lastErr = '';
   for (const s of sources) {
     try {
-      const html = await fetchText(s.url);
+      await throttle();
+      const html = await fetchText(s.url, s.timeout);
       const items = s.parse(html);
-      if (items.length) return items.slice(0, 5).map(it => ({ ...it, source: s.name }));
-    } catch (e) {
-      console.error(`[news] ${s.name} failed for "${query}": ${e.message}`);
-    }
+      if (items.length) {
+        const out = items.slice(0, 5).map(it => ({ ...it, source: s.name }));
+        _newsCache.set(cacheKey, { t: Date.now(), items: out });
+        return out;
+      }
+    } catch (e) { lastErr = e.message; }
   }
+  if (lastErr) console.error(`[news] all sources failed for "${query}": ${lastErr}`);
   return [];
 }
 
-// 一个客户的 4 个维度并行搜索
+// 一个客户的 4 个维度：串行 + 节流，降低被 DDG 限流概率
 async function searchAllCategories(q) {
-  const results = await Promise.all(CATEGORIES.map(async (c) => {
+  const out = {};
+  for (const c of CATEGORIES) {
     try {
       const items = await fetchSearch(c.query(q));
-      return [c.label, items.slice(0, 3)];
+      out[c.label] = items.slice(0, 3);
     } catch (e) {
-      return [c.label, []];
+      out[c.label] = [];
     }
-  }));
-  const out = {};
-  results.forEach(([label, items]) => { out[label] = items; });
+    await sleep(250);
+  }
   return out;
 }
 
