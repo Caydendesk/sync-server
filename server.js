@@ -93,11 +93,11 @@ function customerKeywords(q) {
   return keys;
 }
 
-// 相关性闸门：标题或正文必须出现客户名/别名，否则视为不相关（避免强推无关资讯）
+// 相关性闸门：仅当【标题】出现客户名/别名才算相关（聚合类"公告集锦"标题不提名，直接过滤，避免强推无关资讯）
 function relevantToClient(item, q) {
   const keys = customerKeywords(q);
-  const hay = ((item.title || '') + ' ' + (item.content || item.desc || item.snippet || '')).toLowerCase();
-  return keys.some(k => k && k.length >= 2 && hay.includes(k.toLowerCase()));
+  const title = (item.title || '').toLowerCase();
+  return keys.some(k => k && k.length >= 2 && title.includes(k.toLowerCase()));
 }
 
 function stripTags(s) {
@@ -251,7 +251,10 @@ async function searchAllCategories(q) {
     const profileP = getProfile(q);
     const fillP = CATEGORIES.map(async c => {
       if (!out[c.label].length) {
-        const r = (await tavilySearch(c.tavily(q))).filter(x => relevantToClient(x, q));
+        const seen = new Set();
+        const r = (await tavilySearch(c.tavily(q)))
+          .filter(x => relevantToClient(x, q))
+          .filter(x => { if (seen.has(x.url)) return false; seen.add(x.url); return true; });
         out[c.label] = r.slice(0, 3).map(x => ({ title: x.title, snippet: x.snippet, url: x.url, source: x.source }));
       }
     });
