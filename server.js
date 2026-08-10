@@ -207,15 +207,23 @@ async function searchAllCategories(q) {
   const matched = matchCustomer(items, q);
   console.log(`[news] 客户「${q}」RSS 命中 ${matched.length} 条`);
   const out = classify(matched);
-  if (process.env.TAVILY_API_KEY) {
+  const dbg = {
+    rssHits: matched.length,
+    tavilyKey: process.env.TAVILY_API_KEY ? 'env' : (TAVILY_FALLBACK ? 'fallback' : 'none'),
+    tavilyCalled: 0,
+    tavilyHits: 0
+  };
+  if (process.env.TAVILY_API_KEY || TAVILY_FALLBACK) {
     for (const c of CATEGORIES) {
       if (!out[c.label].length) {
+        dbg.tavilyCalled++;
         const r = await tavilySearch(c.tavily(q));
+        if (r.length) dbg.tavilyHits++;
         out[c.label] = r.slice(0, 3);
       }
     }
   }
-  return out;
+  return { categories: out, dbg };
 }
 
 const server = http.createServer((req, res) => {
@@ -283,9 +291,9 @@ const server = http.createServer((req, res) => {
     }
     (async () => {
       try {
-        const categories = await searchAllCategories(q);
+        const { categories, dbg } = await searchAllCategories(q);
         res.writeHead(200, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({ ok: true, q, updatedAt: Date.now(), categories }));
+        res.end(JSON.stringify({ ok: true, q, updatedAt: Date.now(), categories, dbg }));
       } catch (e) {
         res.writeHead(200, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify({ ok: false, q, error: e.message, categories: {} }));
