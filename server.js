@@ -26,6 +26,139 @@ function saveData(data) {
   } catch (e) { console.error('Save error:', e.message); }
 }
 
+/* =========================================================
+ * 客户资讯：实时多源公开搜索
+ * 主用 Bing，尝试 Baidu，DuckDuckGo 兜底；每刷新都真实拉取最新结果
+ * 按 4 个维度（项目建设 / 股权投融资 / 高层管理人动态 / 所在行业政策）各搜一次
+ * ======================================================= */
+
+// 4 个资讯维度（query 模板带入客户名）
+const CATEGORIES = [
+  { label: '项目建设',       query: q => `${q} 项目建设 OR 工程 OR 中标 OR 扩建` },
+  { label: '股权投融资',     query: q => `${q} 股权融资 OR 战略投资 OR 上市 OR 融资` },
+  { label: '高层管理人动态', query: q => `${q} 高管 任命 OR 变动 OR 辞职 OR 履新` },
+  { label: '所在行业政策',   query: q => `${q} 行业政策 OR 产业政策 OR 新规` }
+];
+
+function stripTags(s) {
+  return (s || '').replace(/<[^>]+>/g, '').replace(/&[a-z]+;/gi, ' ').replace(/\s+/g, ' ').trim();
+}
+
+// 带超时与桌面 UA 的抓取
+async function fetchText(url) {
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), 8000);
+  try {
+    const r = await fetch(url, {
+      headers: {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36',
+        'Accept-Language': 'zh-CN,zh;q=0.9'
+      },
+      signal: ctrl.signal
+    });
+    if (!r.ok) throw new Error('HTTP ' + r.status);
+    return await r.text();
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+// ---- 各搜索引擎结果解析 ----
+
+// Bing 网页结果：<li class="b_algo"> 内有 <h2><a href> 与 <p> 摘要
+function parseBing(html) {
+  const items = [];
+  const blockRe = /<li class="b_algo"[^>]*>([\s\S]*?)<\/li>/g;
+  let m;
+  while ((m = blockRe.exec(html))) {
+    const block = m[1];
+    const a = /<h2>\s*<a[^>]*href="([^"]+)"[^>]*>([\s\S]*?)<\/a>/i.exec(block);
+    if (!a) continue;
+    const url = a[1];
+    if (!/^https?:\/\//i.test(url)) continue;
+    const title = stripTags(a[2]);
+    const sp = /<p[^>]*>([\s\S]*?)<\/p>/i.exec(block);
+    const snippet = sp ? stripTags(sp[1]) : '';
+    if (title) items.push({ title, snippet, url });
+  }
+  return items;
+}
+
+// Baidu 网页结果：<h3 class="t"><a href> 标题，<div class="c-abstract"> 摘要
+function parseBaidu(html) {
+  const items = [];
+  // 反爬验证页直接放弃
+  if (/百度安全验证|wappass|网络不给力/.test(html)) return items;
+  const aRe = /<h3[^>]*class="t"[^>]*>\s*<a[^>]*href="([^"]+)"[^>]*>([\s\S]*?)<\/a>/gi;
+  let m;
+  while ((m = aRe.exec(html))) {
+    const url = m[1];
+    const title = stripTags(m[2]);
+    if (title && /^https?:\/\//i.test(url)) items.push({ title, snippet: '', url });
+  }
+  // 摘要
+  const snips = [];
+  const sRe = /<div class="c-abstract[^"]*"[^>]*>([\s\S]*?)<\/div>/gi;
+  let sm;
+  while ((sm = sRe.exec(html))) snips.push(stripTags(sm[1]));
+  items.forEach((it, i) => { if (snips[i]) it.snippet = snips[i]; });
+  return items;
+}
+
+// DuckDuckGo HTML：<a class="result__a"> 标题（href 为重定向，需解码 uddg），<a class="result__snippet"> 摘要
+function parseDDG(html) {
+  const titles = [];
+  const aRe = /<a[^>]*class="result__a"[^>]*href="([^"]+)"[^>]*>([\s\S]*?)<\/a>/g;
+  let m;
+  while ((m = aRe.exec(html))) {
+    let url = m[1];
+    const u = /[?&]uddg=([^&]+)/.exec(url);
+    if (u) url = decodeURIComponent(u[1]);
+    const title = stripTags(m[2]);
+    if (title && /^https?:\/\//i.test(url)) titles.push({ title, snippet: '', url });
+  }
+  const snips = [];
+  const sRe = /<a[^>]*class="result__snippet"[^>]*>([\s\S]*?)<\/a>/g;
+  let sm;
+  while ((sm = sRe.exec(html))) snips.push(stripTags(sm[1]));
+  titles.forEach((it, i) => { if (snips[i]) it.snippet = snips[i]; });
+  return titles;
+}
+
+// 单条查询：依次尝试 Bing → Baidu → DuckDuckGo，命中即返回
+async function fetchSearch(query) {
+  const sources = [
+    { name: 'Bing',       url: 'https://www.bing.com/search?q=' + encodeURIComponent(query) + '&setlang=zh-CN&cc=CN', parse: parseBing },
+    { name: 'Baidu',      url: 'https://www.baidu.com/s?wd=' + encodeURIComponent(query),                          parse: parseBaidu },
+    { name: 'DuckDuckGo', url: 'https://html.duckduckgo.com/html/?q=' + encodeURIComponent(query),                parse: parseDDG }
+  ];
+  for (const s of sources) {
+    try {
+      const html = await fetchText(s.url);
+      const items = s.parse(html);
+      if (items.length) return items.slice(0, 5).map(it => ({ ...it, source: s.name }));
+    } catch (e) {
+      console.error(`[news] ${s.name} failed for "${query}": ${e.message}`);
+    }
+  }
+  return [];
+}
+
+// 一个客户的 4 个维度并行搜索
+async function searchAllCategories(q) {
+  const results = await Promise.all(CATEGORIES.map(async (c) => {
+    try {
+      const items = await fetchSearch(c.query(q));
+      return [c.label, items.slice(0, 3)];
+    } catch (e) {
+      return [c.label, []];
+    }
+  }));
+  const out = {};
+  results.forEach(([label, items]) => { out[label] = items; });
+  return out;
+}
+
 const server = http.createServer((req, res) => {
   // CORS 允许多设备访问
   res.setHeader('Access-Control-Allow-Origin', '*');
@@ -80,27 +213,23 @@ const server = http.createServer((req, res) => {
     return;
   }
 
-  // 客户资讯：公开数据源（维基百科中文）模糊搜索，每个客户返回最多3条
+  // 客户资讯：实时多源公开搜索（Bing / Baidu / DuckDuckGo），按 4 个维度分组返回
   if (url.pathname === '/api/news') {
     if (req.method !== 'GET') { res.writeHead(405); res.end(); return; }
     const q = (url.searchParams.get('q') || '').toString().trim();
-    if (!q) { res.writeHead(200, { 'Content-Type': 'application/json' }); res.end(JSON.stringify({ ok: true, q: '', items: [] })); return; }
+    if (!q) {
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ ok: true, q: '', updatedAt: Date.now(), categories: {} }));
+      return;
+    }
     (async () => {
       try {
-        const api = 'https://zh.wikipedia.org/w/api.php?action=query&list=search&srsearch='
-          + encodeURIComponent(q) + '&format=json&srlimit=3&srprop=snippet';
-        const r = await fetch(api, { headers: { 'User-Agent': 'WorkBuddy-Sync/1.0 (office workspace news)' } });
-        const j = await r.json();
-        const items = (j && j.query && Array.isArray(j.query.search) ? j.query.search : []).map(s => ({
-          title: s.title,
-          snippet: (s.snippet || '').replace(/<[^>]+>/g, ''),
-          url: 'https://zh.wikipedia.org/wiki/' + encodeURIComponent(s.title.replace(/ /g, '_'))
-        }));
+        const categories = await searchAllCategories(q);
         res.writeHead(200, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({ ok: true, q, items }));
+        res.end(JSON.stringify({ ok: true, q, updatedAt: Date.now(), categories }));
       } catch (e) {
         res.writeHead(200, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({ ok: false, q, error: e.message, items: [] }));
+        res.end(JSON.stringify({ ok: false, q, error: e.message, categories: {} }));
       }
     })();
     return;
@@ -120,4 +249,5 @@ const server = http.createServer((req, res) => {
 server.listen(PORT, () => {
   console.log(`Sync server running on port ${PORT}`);
   console.log(`Sync endpoint: http://localhost:${PORT}/api/sync`);
+  console.log(`News endpoint: http://localhost:${PORT}/api/news`);
 });
