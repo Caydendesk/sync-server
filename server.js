@@ -93,11 +93,18 @@ function customerKeywords(q) {
   return keys;
 }
 
-// 相关性闸门：仅当【标题】出现客户名/别名才算相关（聚合类"公告集锦"标题不提名，直接过滤，避免强推无关资讯）
+// 相关性闸门（统一标准，所有客户一致）：标题或正文命中客户名/别名即算相关（放宽）。
+// 质量底线（对所有客户一致）：纯聚合"公告集锦/盘后公告"类、且标题未提名客户的，仍排除，避免强推无关资讯。
 function relevantToClient(item, q) {
   const keys = customerKeywords(q);
   const title = (item.title || '').toLowerCase();
-  return keys.some(k => k && k.length >= 2 && title.includes(k.toLowerCase()));
+  const body = ((item.content || '') + ' ' + (item.snippet || '') + ' ' + (item.desc || '')).toLowerCase();
+  const inTitle = keys.some(k => k && k.length >= 2 && title.includes(k.toLowerCase()));
+  if (inTitle) return true;                       // 标题提名客户，必留
+  const inBody = keys.some(k => k && k.length >= 2 && body.includes(k.toLowerCase()));
+  if (!inBody) return false;                      // 标题正文都没提，丢弃
+  if (/集锦|公告集锦|盘后公告|财经早报|晚间公告|公告汇总/.test(title)) return false; // 仅正文命中且属聚合文，丢弃
+  return true;
 }
 
 function stripTags(s) {
