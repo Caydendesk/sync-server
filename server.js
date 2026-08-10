@@ -169,11 +169,10 @@ function classify(items) {
   return out;
 }
 
-// Tavily 兜底。优先读环境变量 TAVILY_API_KEY；未配置时回退到内置 dev key（临时，Railway 控制台加变量后会自动覆盖）。
+// Tavily 兜底。仅读环境变量 TAVILY_API_KEY，不在代码内置任何 key（部署方在 Railway 控制台配置）。
 // Tavily 需 POST + JSON body，GET 会 401
-const TAVILY_FALLBACK = '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';
 async function tavilySearch(query) {
-  const KEY = process.env.TAVILY_API_KEY || TAVILY_FALLBACK;
+  const KEY = process.env.TAVILY_API_KEY;
   if (!KEY) return [];
   try {
     const r = await fetch('https://api.tavily.com/search', {
@@ -207,7 +206,7 @@ async function searchAllCategories(q) {
   const matched = matchCustomer(items, q);
   console.log(`[news] 客户「${q}」RSS 命中 ${matched.length} 条`);
   const out = classify(matched);
-  if (process.env.TAVILY_API_KEY || TAVILY_FALLBACK) {
+  if (process.env.TAVILY_API_KEY) {
     for (const c of CATEGORIES) {
       if (!out[c.label].length) {
         const r = await tavilySearch(c.tavily(q));
@@ -309,5 +308,5 @@ server.listen(PORT, () => {
   console.log(`Sync server running on port ${PORT}`);
   console.log(`Sync endpoint: http://localhost:${PORT}/api/sync`);
   console.log(`News endpoint: http://localhost:${PORT}/api/news`);
-  console.log(`News mode: RSS aggregation${process.env.TAVILY_API_KEY ? ' + Tavily fallback' : ' (Tavily key not set)'}`);
+  console.log(`News mode: RSS aggregation${process.env.TAVILY_API_KEY ? ' + Tavily fallback (env var)' : ' (Tavily key not set - only RSS)'}`);
 });
