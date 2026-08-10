@@ -138,12 +138,37 @@ function parseDDG(html) {
   return titles;
 }
 
-// 单条查询：DuckDuckGo 优先（html + lite 两个接口兜底），Bing/Baidu 作尽力兜底
-// 注：Baidu 拦截服务器 IP（超时）；Bing 结果页 JS 渲染常为空；DDG 聚合 Bing/Yahoo 索引最稳
+// 单条查询：
+//  1) 若配置了 BRAVE_API_KEY，优先用 Brave Search API（服务器友好、稳定、可按时间取最新）
+//  2) 否则回退 DuckDuckGo 爬虫（无密钥，但数据中心 IP 易被限流，时好时坏）
+//  注：Baidu 拦截服务器 IP（超时）；Bing 结果页 JS 渲染常为空；故 DDG 仅作兜底
 async function fetchSearch(query) {
   const cacheKey = 'q:' + query;
   const cached = _newsCache.get(cacheKey);
   if (cached && (Date.now() - cached.t) < NEWS_CACHE_TTL) return cached.items;
+
+  // —— 主通道：Brave Search API ——
+  if (process.env.BRAVE_API_KEY) {
+    try {
+      await throttle();
+      const url = 'https://api.search.brave.com/res/v1/web/search?q=' + encodeURIComponent(query)
+        + '&count=5&country=cn&search_lang=zh&freshness=pw';
+      const r = await fetch(url, {
+        headers: { 'Accept': 'application/json', 'X-Subscription-Token': process.env.BRAVE_API_KEY }
+      });
+      if (r.ok) {
+        const j = await r.json();
+        const list = (j && j.data && Array.isArray(j.data.web_results)) ? j.data.web_results : [];
+        if (list.length) {
+          const items = list.slice(0, 5).map(w => ({ title: w.title, snippet: w.description || '', url: w.url, source: 'Brave' }));
+          _newsCache.set(cacheKey, { t: Date.now(), items });
+          return items;
+        }
+      }
+    } catch (e) { console.error(`[news] Brave failed for "${query}": ${e.message}`); }
+  }
+
+  // —— 兜底：DuckDuckGo 爬虫 ——
   const sources = [
     { name: 'DuckDuckGo',      url: 'https://html.duckduckgo.com/html/?q=' + encodeURIComponent(query),        parse: parseDDG },
     { name: 'DuckDuckGo Lite', url: 'https://lite.duckduckgo.com/lite/?q=' + encodeURIComponent(query),        parse: parseDDG },
