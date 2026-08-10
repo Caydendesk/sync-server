@@ -105,10 +105,11 @@ function parseBaidu(html) {
   return items;
 }
 
-// DuckDuckGo HTML：<a class="result__a"> 标题（href 为重定向，需解码 uddg），<a class="result__snippet"> 摘要
+// DuckDuckGo（html / lite 两种接口统一解析）：标题在 class 含 result__a / result-link 的 <a>，
+// 摘要在 class 含 result__snippet / result-snippet；href 多为重定向，需解码 uddg 参数
 function parseDDG(html) {
   const titles = [];
-  const aRe = /<a[^>]*class="result__a"[^>]*href="([^"]+)"[^>]*>([\s\S]*?)<\/a>/g;
+  const aRe = /<a[^>]*class="[^"]*(?:result__a|result-link)[^"]*"[^>]*href="([^"]+)"[^>]*>([\s\S]*?)<\/a>/gi;
   let m;
   while ((m = aRe.exec(html))) {
     let url = m[1];
@@ -118,19 +119,21 @@ function parseDDG(html) {
     if (title && /^https?:\/\//i.test(url)) titles.push({ title, snippet: '', url });
   }
   const snips = [];
-  const sRe = /<a[^>]*class="result__snippet"[^>]*>([\s\S]*?)<\/a>/g;
+  const sRe = /<(?:a|td|div)[^>]*class="[^"]*(?:result__snippet|result-snippet)[^"]*"[^>]*>([\s\S]*?)<\/(?:a|td|div)>/gi;
   let sm;
   while ((sm = sRe.exec(html))) snips.push(stripTags(sm[1]));
   titles.forEach((it, i) => { if (snips[i]) it.snippet = snips[i]; });
   return titles;
 }
 
-// 单条查询：依次尝试 Bing → Baidu → DuckDuckGo，命中即返回
+// 单条查询：DuckDuckGo 为稳定可用的公开搜索（聚合 Bing/Yahoo 索引），Bing/Baidu 作尽力兜底
+// 注：Baidu 会拦截服务器 IP（超时）；Bing 结果页为 JS 渲染，静态抓取常为空；故 DDG 优先
 async function fetchSearch(query) {
   const sources = [
-    { name: 'Bing',       url: 'https://www.bing.com/search?q=' + encodeURIComponent(query) + '&setlang=zh-CN&cc=CN', parse: parseBing },
-    { name: 'Baidu',      url: 'https://www.baidu.com/s?wd=' + encodeURIComponent(query),                          parse: parseBaidu },
-    { name: 'DuckDuckGo', url: 'https://html.duckduckgo.com/html/?q=' + encodeURIComponent(query),                parse: parseDDG }
+    { name: 'DuckDuckGo',      url: 'https://html.duckduckgo.com/html/?q=' + encodeURIComponent(query),        parse: parseDDG },
+    { name: 'DuckDuckGo Lite', url: 'https://lite.duckduckgo.com/lite/?q=' + encodeURIComponent(query),        parse: parseDDG },
+    { name: 'Bing',            url: 'https://www.bing.com/search?q=' + encodeURIComponent(query) + '&setlang=zh-CN&cc=CN', parse: parseBing },
+    { name: 'Baidu',           url: 'https://www.baidu.com/s?wd=' + encodeURIComponent(query),                  parse: parseBaidu }
   ];
   for (const s of sources) {
     try {
