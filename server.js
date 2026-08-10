@@ -27,46 +27,67 @@ function saveData(data) {
 }
 
 /* =========================================================
- * 客户资讯：实时多源公开搜索
- * 主用 Bing，尝试 Baidu，DuckDuckGo 兜底；每刷新都真实拉取最新结果
- * 按 4 个维度（项目建设 / 股权投融资 / 高层管理人动态 / 所在行业政策）各搜一次
+ * 客户资讯：RSS 为主 + Tavily 免费层兜底
+ *  - 主通道：聚合公开 RSS 新闻源，按【客户名称】模糊匹配，按 4 维度分类
+ *  - 兜底：  若配置 TAVILY_API_KEY，对 RSS 未覆盖到的维度用 Tavily 新闻搜索补全
+ *  - 每次刷新都重新匹配（源内容缓存 10 分钟，源本身更新即视为新）
+ *  4 个维度：项目建设 / 股权投融资 / 高层管理人动态 / 所在行业政策
  * ======================================================= */
 
-// 4 个资讯维度（query 模板带入客户名）
-const CATEGORIES = [
-  { label: '项目建设',       query: q => `${q} 项目建设 OR 工程 OR 中标` },
-  { label: '股权投融资',     query: q => `${q} 股权融资 OR 战略投资 OR 上市 OR 融资` },
-  { label: '高层管理人动态', query: q => `${q} 高管 OR 董事长 OR 总裁 任命 变动` },
-  { label: '所在行业政策',   query: q => `${q} 行业政策 OR 产业政策 OR 新规` }
+// 已验证可达、且能解析出 item 的公开 RSS 源（中文为主，覆盖财经/科技/政策/综合）
+const RSS_FEEDS = [
+  { name: '新华网财经',   url: 'https://www.news.cn/fortune/news_fortune.xml' },
+  { name: '人民网财经',   url: 'https://www.people.com.cn/rss/politics.xml' },
+  { name: 'IT之家',       url: 'https://www.ithome.com/rss/' },
+  { name: '钛媒体',       url: 'https://www.tmtpost.com/rss.xml' },
+  { name: '中国新闻网',   url: 'https://www.chinanews.com.cn/rss/scroll-news.xml' },
+  { name: '少数派',       url: 'https://sspai.com/feed' }
 ];
 
+// 4 个资讯维度：keys 用于把命中的 RSS 条目归类；query 用于 Tavily 兜底搜索
+const CATEGORIES = [
+  { label: '项目建设',       keys: ['项目', '工程', '中标', '开工', '投产', '建设', '基地', '产业园', '签约', '奠基', '动工', '量产', '下线'], query: q => `${q} 项目建设 OR 工程 OR 中标 OR 开工` },
+  { label: '股权投融资',     keys: ['融资', '投资', '股权', '上市', 'IPO', '增资', '并购', '收购', '估值', '轮融资', '纳斯达克', '港股', '财报', '营收', '利润', '市值', '股价', '分红'], query: q => `${q} 股权融资 OR 战略投资 OR 上市 OR 融资` },
+  { label: '高层管理人动态', keys: ['董事长', '总裁', '总经理', '高管', '任命', '辞任', '辞职', '履新', '换帅', '变动', '回应', '表态'], query: q => `${q} 高管 OR 董事长 OR 总裁 任命 变动` },
+  { label: '所在行业政策',   keys: ['政策', '新规', '条例', '通知', '办法', '监管', '工信部', '发改委', '部委', '意见', '规划', '印发', '标准', '指南'], query: q => `${q} 行业政策 OR 产业政策 OR 新规` }
+];
+
+// 未归入以上 4 类、但确实命中客户的资讯，统一进「综合动态」，避免遗漏
+const GENERAL_LABEL = '综合动态';
+
+// 常见别名（提升知名企业命中率）
+const ALIASES = {
+  '比亚迪': 'BYD', '腾讯': 'Tencent', '阿里巴巴': '阿里', '阿里': '阿里巴巴',
+  '小米': 'Xiaomi', '美团': 'Meituan', '华为': 'Huawei', '京东': 'JD',
+  '百度': 'Baidu', '网易': 'NetEase', '字节跳动': '抖音'
+};
+
+// 去掉公司名常见后缀，提取可用于匹配的核心词
+function customerKeywords(q) {
+  const stops = ['股份有限公司', '有限公司', '有限责任公司', '集团', '公司', '供应链', '科技', '企业', '（', '('];
+  let k = q;
+  for (const s of stops) { k = k.split(s)[0]; }
+  const keys = [q, k].filter((v, i, a) => v && a.indexOf(v) === i);
+  if (ALIASES[q]) keys.push(ALIASES[q]);
+  return keys;
+}
+
 function stripTags(s) {
-  return (s || '').replace(/<[^>]+>/g, '').replace(/&[a-z]+;/gi, ' ').replace(/\s+/g, ' ').trim();
+  return (s || '')
+    .replace(/&lt;/gi, '<').replace(/&gt;/gi, '>')
+    .replace(/<[^>]+>/g, '')
+    .replace(/&[a-z]+;/gi, ' ')
+    .replace(/p data-vmark="[^"]*"/gi, '')
+    .replace(/\s+/g, ' ').trim();
 }
 
-// 全局节流 + 短时缓存：避免对 DDG 突发并行请求触发限流（数据中心 IP 易被拦）
-const _newsCache = new Map();
-const NEWS_CACHE_TTL = 90000;
-let _lastOutbound = 0;
-const MIN_GAP_MS = 900;
-function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
-async function throttle() {
-  const wait = MIN_GAP_MS - (Date.now() - _lastOutbound);
-  if (wait > 0) await sleep(wait);
-  _lastOutbound = Date.now();
-}
-
-// 带超时与桌面 UA 的抓取（timeout 可覆盖，百度用更短超时快速放弃）
+// 带超时与 UA 的抓取
 async function fetchText(url, timeoutMs) {
   const ctrl = new AbortController();
-  const timer = setTimeout(() => ctrl.abort(), timeoutMs || 8000);
+  const timer = setTimeout(() => ctrl.abort(), timeoutMs || 9000);
   try {
     const r = await fetch(url, {
-      headers: {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36',
-        'Accept-Language': 'zh-CN,zh;q=0.9'
-      },
-      signal: ctrl.signal
+      headers: { 'User-Agent': 'Mozilla/5.0 (compatible; WorkbenchRSS/1.0)' }
     });
     if (!r.ok) throw new Error('HTTP ' + r.status);
     return await r.text();
@@ -75,134 +96,113 @@ async function fetchText(url, timeoutMs) {
   }
 }
 
-// ---- 各搜索引擎结果解析 ----
-
-// Bing 网页结果：<li class="b_algo"> 内有 <h2><a href> 与 <p> 摘要
-function parseBing(html) {
+// 通用 RSS / Atom 解析
+function parseRss(xml) {
   const items = [];
-  const blockRe = /<li class="b_algo"[^>]*>([\s\S]*?)<\/li>/g;
+  const blockRe = /<item>([\s\S]*?)<\/item>/g;
   let m;
-  while ((m = blockRe.exec(html))) {
-    const block = m[1];
-    const a = /<h2>\s*<a[^>]*href="([^"]+)"[^>]*>([\s\S]*?)<\/a>/i.exec(block);
-    if (!a) continue;
-    const url = a[1];
-    if (!/^https?:\/\//i.test(url)) continue;
-    const title = stripTags(a[2]);
-    const sp = /<p[^>]*>([\s\S]*?)<\/p>/i.exec(block);
-    const snippet = sp ? stripTags(sp[1]) : '';
-    if (title) items.push({ title, snippet, url });
+  while ((m = blockRe.exec(xml))) {
+    const b = m[1];
+    const title = /<title>([\s\S]*?)<\/title>/i.exec(b);
+    const link = /<link>([\s\S]*?)<\/link>/i.exec(b);
+    const desc = /<description>([\s\S]*?)<\/description>/i.exec(b);
+    if (title) items.push({ title: stripTags(title[1]), link: link ? link[1].trim() : '', desc: desc ? stripTags(desc[1]) : '' });
+  }
+  const entryRe = /<entry>([\s\S]*?)<\/entry>/g;
+  while ((m = entryRe.exec(xml))) {
+    const b = m[1];
+    const title = /<title[^>]*>([\s\S]*?)<\/title>/i.exec(b);
+    const link = /<link[^>]*href="([^"]+)"[^>]*>/i.exec(b);
+    const desc = /<summary[^>]*>([\s\S]*?)<\/summary>/i.exec(b);
+    if (title) items.push({ title: stripTags(title[1]), link: link ? link[1] : '', desc: desc ? stripTags(desc[1]) : '' });
   }
   return items;
 }
 
-// Baidu 网页结果：<h3 class="t"><a href> 标题，<div class="c-abstract"> 摘要
-function parseBaidu(html) {
-  const items = [];
-  // 反爬验证页直接放弃
-  if (/百度安全验证|wappass|网络不给力/.test(html)) return items;
-  const aRe = /<h3[^>]*class="t"[^>]*>\s*<a[^>]*href="([^"]+)"[^>]*>([\s\S]*?)<\/a>/gi;
-  let m;
-  while ((m = aRe.exec(html))) {
-    const url = m[1];
-    const title = stripTags(m[2]);
-    if (title && /^https?:\/\//i.test(url)) items.push({ title, snippet: '', url });
-  }
-  // 摘要
-  const snips = [];
-  const sRe = /<div class="c-abstract[^"]*"[^>]*>([\s\S]*?)<\/div>/gi;
-  let sm;
-  while ((sm = sRe.exec(html))) snips.push(stripTags(sm[1]));
-  items.forEach((it, i) => { if (snips[i]) it.snippet = snips[i]; });
-  return items;
-}
-
-// DuckDuckGo（html / lite 两种接口统一解析）：标题在 class 含 result__a / result-link 的 <a>，
-// 摘要在 class 含 result__snippet / result-snippet；href 多为重定向，需解码 uddg 参数
-function parseDDG(html) {
-  const titles = [];
-  const aRe = /<a[^>]*class="[^"]*(?:result__a|result-link)[^"]*"[^>]*href="([^"]+)"[^>]*>([\s\S]*?)<\/a>/gi;
-  let m;
-  while ((m = aRe.exec(html))) {
-    let url = m[1];
-    const u = /[?&]uddg=([^&]+)/.exec(url);
-    if (u) url = decodeURIComponent(u[1]);
-    const title = stripTags(m[2]);
-    if (title && /^https?:\/\//i.test(url)) titles.push({ title, snippet: '', url });
-  }
-  const snips = [];
-  const sRe = /<(?:a|td|div)[^>]*class="[^"]*(?:result__snippet|result-snippet)[^"]*"[^>]*>([\s\S]*?)<\/(?:a|td|div)>/gi;
-  let sm;
-  while ((sm = sRe.exec(html))) snips.push(stripTags(sm[1]));
-  titles.forEach((it, i) => { if (snips[i]) it.snippet = snips[i]; });
-  return titles;
-}
-
-// 单条查询：
-//  1) 若配置了 BRAVE_API_KEY，优先用 Brave Search API（服务器友好、稳定、可按时间取最新）
-//  2) 否则回退 DuckDuckGo 爬虫（无密钥，但数据中心 IP 易被限流，时好时坏）
-//  注：Baidu 拦截服务器 IP（超时）；Bing 结果页 JS 渲染常为空；故 DDG 仅作兜底
-async function fetchSearch(query) {
-  const cacheKey = 'q:' + query;
-  const cached = _newsCache.get(cacheKey);
-  if (cached && (Date.now() - cached.t) < NEWS_CACHE_TTL) return cached.items;
-
-  // —— 主通道：Brave Search API ——
-  if (process.env.BRAVE_API_KEY) {
+// RSS 聚合（带缓存，源更新慢，10 分钟足够新鲜）
+let _rssCache = { t: 0, items: [] };
+const RSS_TTL = 10 * 60 * 1000;
+async function loadAllRss() {
+  if (Date.now() - _rssCache.t < RSS_TTL && _rssCache.items.length) return _rssCache.items;
+  const all = [];
+  await Promise.all(RSS_FEEDS.map(async f => {
     try {
-      await throttle();
-      const url = 'https://api.search.brave.com/res/v1/web/search?q=' + encodeURIComponent(query)
-        + '&count=5&country=cn&search_lang=zh&freshness=pw';
-      const r = await fetch(url, {
-        headers: { 'Accept': 'application/json', 'X-Subscription-Token': process.env.BRAVE_API_KEY }
-      });
-      if (r.ok) {
-        const j = await r.json();
-        const list = (j && j.data && Array.isArray(j.data.web_results)) ? j.data.web_results : [];
-        if (list.length) {
-          const items = list.slice(0, 5).map(w => ({ title: w.title, snippet: w.description || '', url: w.url, source: 'Brave' }));
-          _newsCache.set(cacheKey, { t: Date.now(), items });
-          return items;
-        }
-      }
-    } catch (e) { console.error(`[news] Brave failed for "${query}": ${e.message}`); }
-  }
-
-  // —— 兜底：DuckDuckGo 爬虫 ——
-  const sources = [
-    { name: 'DuckDuckGo',      url: 'https://html.duckduckgo.com/html/?q=' + encodeURIComponent(query),        parse: parseDDG },
-    { name: 'DuckDuckGo Lite', url: 'https://lite.duckduckgo.com/lite/?q=' + encodeURIComponent(query),        parse: parseDDG },
-    { name: 'Bing',            url: 'https://www.bing.com/search?q=' + encodeURIComponent(query) + '&setlang=zh-CN&cc=CN', parse: parseBing },
-    { name: 'Baidu',           url: 'https://www.baidu.com/s?wd=' + encodeURIComponent(query),                 parse: parseBaidu, timeout: 5000 }
-  ];
-  let lastErr = '';
-  for (const s of sources) {
-    try {
-      await throttle();
-      const html = await fetchText(s.url, s.timeout);
-      const items = s.parse(html);
-      if (items.length) {
-        const out = items.slice(0, 5).map(it => ({ ...it, source: s.name }));
-        _newsCache.set(cacheKey, { t: Date.now(), items: out });
-        return out;
-      }
-    } catch (e) { lastErr = e.message; }
-  }
-  if (lastErr) console.error(`[news] all sources failed for "${query}": ${lastErr}`);
-  return [];
+      const xml = await fetchText(f.url, 9000);
+      const items = parseRss(xml);
+      items.forEach(it => { it.source = f.name; });
+      all.push(...items.filter(it => it.title && it.title.trim()));
+    } catch (e) { console.error(`[rss] ${f.name} failed: ${e.message}`); }
+  }));
+  console.log(`[rss] 聚合完成，共 ${all.length} 条`);
+  _rssCache = { t: Date.now(), items: all };
+  return all;
 }
 
-// 一个客户的 4 个维度：串行 + 节流，降低被 DDG 限流概率
-async function searchAllCategories(q) {
+// 按客户名模糊匹配
+function matchCustomer(items, q) {
+  const keys = customerKeywords(q);
+  return items.filter(it => {
+    const text = it.title + ' ' + it.desc;
+    return keys.some(k => k && text.includes(k));
+  });
+}
+
+// 把命中条目按维度关键词归类（每条只归入第一个命中的维度），未归类的进综合动态
+function classify(items) {
   const out = {};
-  for (const c of CATEGORIES) {
-    try {
-      const items = await fetchSearch(c.query(q));
-      out[c.label] = items.slice(0, 3);
-    } catch (e) {
-      out[c.label] = [];
+  CATEGORIES.forEach(c => { out[c.label] = []; });
+  out[GENERAL_LABEL] = [];
+  for (const it of items) {
+    const text = it.title + ' ' + it.desc;
+    let placed = false;
+    for (const c of CATEGORIES) {
+      if (c.keys.some(k => text.includes(k))) {
+        out[c.label].push({ title: it.title, snippet: (it.desc || '').slice(0, 120), url: it.link, source: it.source });
+        placed = true;
+        break;
+      }
     }
-    await sleep(400);
+    if (!placed) out[GENERAL_LABEL].push({ title: it.title, snippet: (it.desc || '').slice(0, 120), url: it.link, source: it.source });
+  }
+  CATEGORIES.forEach(c => { out[c.label] = out[c.label].slice(0, 3); });
+  out[GENERAL_LABEL] = out[GENERAL_LABEL].slice(0, 5);
+  return out;
+}
+
+// Tavily 兜底（仅当配置了 TAVILY_API_KEY）
+async function tavilySearch(query) {
+  if (!process.env.TAVILY_API_KEY) return [];
+  try {
+    const url = 'https://api.tavily.com/search?api_key=' + encodeURIComponent(process.env.TAVILY_API_KEY)
+      + '&query=' + encodeURIComponent(query) + '&max_results=5&topic=news&days=30';
+    const r = await fetch(url, { headers: { 'Content-Type': 'application/json' } });
+    if (!r.ok) throw new Error('HTTP ' + r.status);
+    const j = await r.json();
+    return (j.results || []).map(x => ({
+      title: x.title,
+      snippet: (x.content || '').slice(0, 120),
+      url: x.url,
+      source: 'Tavily'
+    }));
+  } catch (e) {
+    console.error(`[news] Tavily failed for "${query}": ${e.message}`);
+    return [];
+  }
+}
+
+// 一个客户的 4 个维度：RSS 匹配为主，空维度用 Tavily 补
+async function searchAllCategories(q) {
+  const items = await loadAllRss();
+  const matched = matchCustomer(items, q);
+  console.log(`[news] 客户「${q}」RSS 命中 ${matched.length} 条`);
+  const out = classify(matched);
+  if (process.env.TAVILY_API_KEY) {
+    for (const c of CATEGORIES) {
+      if (!out[c.label].length) {
+        const r = await tavilySearch(c.query(q));
+        out[c.label] = r.slice(0, 3);
+      }
+    }
   }
   return out;
 }
@@ -261,7 +261,7 @@ const server = http.createServer((req, res) => {
     return;
   }
 
-  // 客户资讯：实时多源公开搜索（Bing / Baidu / DuckDuckGo），按 4 个维度分组返回
+  // 客户资讯：RSS 为主 + Tavily 兜底，按 4 个维度分组返回
   if (url.pathname === '/api/news') {
     if (req.method !== 'GET') { res.writeHead(405); res.end(); return; }
     const q = (url.searchParams.get('q') || '').toString().trim();
@@ -298,4 +298,5 @@ server.listen(PORT, () => {
   console.log(`Sync server running on port ${PORT}`);
   console.log(`Sync endpoint: http://localhost:${PORT}/api/sync`);
   console.log(`News endpoint: http://localhost:${PORT}/api/news`);
+  console.log(`News mode: RSS aggregation${process.env.TAVILY_API_KEY ? ' + Tavily fallback' : ' (Tavily key not set)'}`);
 });
