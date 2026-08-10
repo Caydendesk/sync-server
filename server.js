@@ -34,9 +34,9 @@ function saveData(data) {
 
 // 4 个资讯维度（query 模板带入客户名）
 const CATEGORIES = [
-  { label: '项目建设',       query: q => `${q} 项目建设 OR 工程 OR 中标 OR 扩建` },
+  { label: '项目建设',       query: q => `${q} 项目建设 OR 工程 OR 中标` },
   { label: '股权投融资',     query: q => `${q} 股权融资 OR 战略投资 OR 上市 OR 融资` },
-  { label: '高层管理人动态', query: q => `${q} 高管 任命 OR 变动 OR 辞职 OR 履新` },
+  { label: '高层管理人动态', query: q => `${q} 高管 OR 董事长 OR 总裁 任命 变动` },
   { label: '所在行业政策',   query: q => `${q} 行业政策 OR 产业政策 OR 新规` }
 ];
 
@@ -48,7 +48,7 @@ function stripTags(s) {
 const _newsCache = new Map();
 const NEWS_CACHE_TTL = 90000;
 let _lastOutbound = 0;
-const MIN_GAP_MS = 600;
+const MIN_GAP_MS = 900;
 function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
 async function throttle() {
   const wait = MIN_GAP_MS - (Date.now() - _lastOutbound);
@@ -177,7 +177,7 @@ async function searchAllCategories(q) {
     } catch (e) {
       out[c.label] = [];
     }
-    await sleep(250);
+    await sleep(400);
   }
   return out;
 }
