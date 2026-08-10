@@ -44,12 +44,12 @@ const RSS_FEEDS = [
   { name: '少数派',       url: 'https://sspai.com/feed' }
 ];
 
-// 4 个资讯维度：keys 用于把命中的 RSS 条目归类；query 用于 Tavily 兜底搜索
+// 4 个资讯维度：keys 用于把命中的 RSS 条目归类；tavily 用于兜底搜索的自然语言查询
 const CATEGORIES = [
-  { label: '项目建设',       keys: ['项目', '工程', '中标', '开工', '投产', '建设', '基地', '产业园', '签约', '奠基', '动工', '量产', '下线'], query: q => `${q} 项目建设 OR 工程 OR 中标 OR 开工` },
-  { label: '股权投融资',     keys: ['融资', '投资', '股权', '上市', 'IPO', '增资', '并购', '收购', '估值', '轮融资', '纳斯达克', '港股', '财报', '营收', '利润', '市值', '股价', '分红'], query: q => `${q} 股权融资 OR 战略投资 OR 上市 OR 融资` },
-  { label: '高层管理人动态', keys: ['董事长', '总裁', '总经理', '高管', '任命', '辞任', '辞职', '履新', '换帅', '变动', '回应', '表态'], query: q => `${q} 高管 OR 董事长 OR 总裁 任命 变动` },
-  { label: '所在行业政策',   keys: ['政策', '新规', '条例', '通知', '办法', '监管', '工信部', '发改委', '部委', '意见', '规划', '印发', '标准', '指南'], query: q => `${q} 行业政策 OR 产业政策 OR 新规` }
+  { label: '项目建设',       keys: ['项目', '工程', '中标', '开工', '投产', '建设', '基地', '产业园', '签约', '奠基', '动工', '量产', '下线'], tavily: q => `${q} 项目建设 工程 中标 投产 基地` },
+  { label: '股权投融资',     keys: ['融资', '投资', '股权', '上市', 'IPO', '增资', '并购', '收购', '估值', '轮融资', '纳斯达克', '港股', '财报', '营收', '利润', '市值', '股价', '分红'], tavily: q => `${q} 股权融资 战略投资 上市 并购 财报` },
+  { label: '高层管理人动态', keys: ['董事长', '总裁', '总经理', '高管', '任命', '辞任', '辞职', '履新', '换帅', '变动', '回应', '表态'], tavily: q => `${q} 董事长 总裁 高管 任命 变动 履新` },
+  { label: '所在行业政策',   keys: ['政策', '新规', '条例', '通知', '办法', '监管', '工信部', '发改委', '部委', '意见', '规划', '印发', '标准', '指南'], tavily: q => `${q} 行业政策 产业政策 规划 新规 监管` }
 ];
 
 // 未归入以上 4 类、但确实命中客户的资讯，统一进「综合动态」，避免遗漏
@@ -169,13 +169,24 @@ function classify(items) {
   return out;
 }
 
-// Tavily 兜底（仅当配置了 TAVILY_API_KEY）
+// Tavily 兜底。优先读环境变量 TAVILY_API_KEY；未配置时回退到内置 dev key（临时，Railway 控制台加变量后会自动覆盖）。
+// Tavily 需 POST + JSON body，GET 会 401
+const TAVILY_FALLBACK = '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';
 async function tavilySearch(query) {
-  if (!process.env.TAVILY_API_KEY) return [];
+  const KEY = process.env.TAVILY_API_KEY || TAVILY_FALLBACK;
+  if (!KEY) return [];
   try {
-    const url = 'https://api.tavily.com/search?api_key=' + encodeURIComponent(process.env.TAVILY_API_KEY)
-      + '&query=' + encodeURIComponent(query) + '&max_results=5&topic=news&days=30';
-    const r = await fetch(url, { headers: { 'Content-Type': 'application/json' } });
+    const r = await fetch('https://api.tavily.com/search', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        api_key: KEY,
+        query,
+        topic: 'news',
+        max_results: 3,
+        days: 30
+      })
+    });
     if (!r.ok) throw new Error('HTTP ' + r.status);
     const j = await r.json();
     return (j.results || []).map(x => ({
@@ -199,7 +210,7 @@ async function searchAllCategories(q) {
   if (process.env.TAVILY_API_KEY) {
     for (const c of CATEGORIES) {
       if (!out[c.label].length) {
-        const r = await tavilySearch(c.query(q));
+        const r = await tavilySearch(c.tavily(q));
         out[c.label] = r.slice(0, 3);
       }
     }
