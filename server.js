@@ -55,6 +55,26 @@ const CATEGORIES = [
 // 未归入以上 4 类、但确实命中客户的资讯，统一进「综合动态」，避免遗漏
 const GENERAL_LABEL = '综合动态';
 
+// 已知客户：精确匹配词 + 公司简介（≤5 句，统一格式）。未知客户走 Tavily 兜底简介。
+const CLIENT_PROFILES = {
+  '紫金矿业': {
+    keys: ['紫金矿业', '紫金'],
+    profile: '紫金矿业是全球领先的矿业企业，主营黄金、铜、锌等金属矿产的勘探、开采与冶炼。公司总部位于福建龙岩，在海外拥有多座大型矿山，铜产量位居国内前列。近年持续布局锂、钴等新能源金属，向综合矿业巨头迈进。'
+  },
+  '福建省工业控股': {
+    keys: ['福建省工业控股', '福建工业控股', '福建工控'],
+    profile: '福建省工业控股集团是福建省属国有重要骨干企业，聚焦机械制造、电子信息、冶金建材等工业领域的投资与运营。集团承担省内产业升级与战略重组平台职能，下辖多家工业类子公司。'
+  },
+  '华电新能源': {
+    keys: ['华电新能源', '华电新能'],
+    profile: '华电新能源集团是中国华电集团旗下新能源上市平台，主营风电、光伏等清洁能源项目的开发、投资与运营。公司装机规模位居行业前列，是国内重要的绿电运营商之一。'
+  },
+  '南平铝业': {
+    keys: ['南平铝业', '南平铝'],
+    profile: '福建省南平铝业是华东地区重要的铝加工企业，主营铝型材、铝板带箔等产品的研发与生产。产品广泛应用于建筑、交通与包装领域，是区域铝工业龙头企业。'
+  }
+};
+
 // 常见别名（提升知名企业命中率）
 const ALIASES = {
   '比亚迪': 'BYD', '腾讯': 'Tencent', '阿里巴巴': '阿里', '阿里': '阿里巴巴',
@@ -62,14 +82,22 @@ const ALIASES = {
   '百度': 'Baidu', '网易': 'NetEase', '字节跳动': '抖音'
 };
 
-// 去掉公司名常见后缀，提取可用于匹配的核心词
+// 提取客户匹配词：已知客户用精确词表，未知客户去掉常见后缀兜底
 function customerKeywords(q) {
+  if (CLIENT_PROFILES[q]) return CLIENT_PROFILES[q].keys;
   const stops = ['股份有限公司', '有限公司', '有限责任公司', '集团', '公司', '供应链', '科技', '企业', '（', '('];
   let k = q;
   for (const s of stops) { k = k.split(s)[0]; }
   const keys = [q, k].filter((v, i, a) => v && a.indexOf(v) === i);
   if (ALIASES[q]) keys.push(ALIASES[q]);
   return keys;
+}
+
+// 相关性闸门：标题或正文必须出现客户名/别名，否则视为不相关（避免强推无关资讯）
+function relevantToClient(item, q) {
+  const keys = customerKeywords(q);
+  const hay = ((item.title || '') + ' ' + (item.content || item.desc || item.snippet || '')).toLowerCase();
+  return keys.some(k => k && k.length >= 2 && hay.includes(k.toLowerCase()));
 }
 
 function stripTags(s) {
@@ -190,7 +218,8 @@ async function tavilySearch(query) {
     const j = await r.json();
     return (j.results || []).map(x => ({
       title: x.title,
-      snippet: (x.content || '').slice(0, 120),
+      content: x.content || '',
+      snippet: (x.content || '').slice(0, 140),
       url: x.url,
       source: 'Tavily'
     }));
@@ -200,21 +229,39 @@ async function tavilySearch(query) {
   }
 }
 
-// 一个客户的 4 个维度：RSS 匹配为主，空维度用 Tavily 补
+// 公司简介：已知客户返回内置简介；未知客户用 Tavily 尽力取一段（≤160 字）
+async function getProfile(q) {
+  if (CLIENT_PROFILES[q]) return CLIENT_PROFILES[q].profile;
+  if (!process.env.TAVILY_API_KEY) return '';
+  const r = await tavilySearch(q + ' 公司简介 主营业务 规模');
+  const top = r[0];
+  if (!top) return '';
+  return (top.content || top.snippet || '').replace(/\s+/g, ' ').trim().slice(0, 160);
+}
+
+// 一个客户的 4 个维度：RSS 匹配为主，空维度用 Tavily 补（均做相关性过滤）
 async function searchAllCategories(q) {
   const items = await loadAllRss();
   const matched = matchCustomer(items, q);
   console.log(`[news] 客户「${q}」RSS 命中 ${matched.length} 条`);
   const out = classify(matched);
+  let profile = '';
   if (process.env.TAVILY_API_KEY) {
-    for (const c of CATEGORIES) {
+    // 并行：简介 + 各空维度兜底（兜底结果必须过相关性闸门）
+    const profileP = getProfile(q);
+    const fillP = CATEGORIES.map(async c => {
       if (!out[c.label].length) {
-        const r = await tavilySearch(c.tavily(q));
-        out[c.label] = r.slice(0, 3);
+        const r = (await tavilySearch(c.tavily(q))).filter(x => relevantToClient(x, q));
+        out[c.label] = r.slice(0, 3).map(x => ({ title: x.title, snippet: x.snippet, url: x.url, source: x.source }));
       }
-    }
+    });
+    const [p] = await Promise.all([profileP, ...fillP]);
+    profile = p;
   }
-  return out;
+  let total = 0;
+  CATEGORIES.forEach(c => { total += out[c.label].length; });
+  total += out[GENERAL_LABEL].length;
+  return { profile, found: total > 0, categories: out };
 }
 
 const server = http.createServer((req, res) => {
@@ -282,12 +329,12 @@ const server = http.createServer((req, res) => {
     }
     (async () => {
       try {
-        const categories = await searchAllCategories(q);
+        const result = await searchAllCategories(q);
         res.writeHead(200, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({ ok: true, q, updatedAt: Date.now(), categories }));
+        res.end(JSON.stringify({ ok: true, q, updatedAt: Date.now(), profile: result.profile, found: result.found, categories: result.categories }));
       } catch (e) {
         res.writeHead(200, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({ ok: false, q, error: e.message, categories: {} }));
+        res.end(JSON.stringify({ ok: false, q, error: e.message, profile: '', found: false, categories: {} }));
       }
     })();
     return;
