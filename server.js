@@ -80,6 +80,32 @@ const server = http.createServer((req, res) => {
     return;
   }
 
+  // 客户资讯：公开数据源（维基百科中文）模糊搜索，每个客户返回最多3条
+  if (url.pathname === '/api/news') {
+    if (req.method !== 'GET') { res.writeHead(405); res.end(); return; }
+    const q = (url.searchParams.get('q') || '').toString().trim();
+    if (!q) { res.writeHead(200, { 'Content-Type': 'application/json' }); res.end(JSON.stringify({ ok: true, q: '', items: [] })); return; }
+    (async () => {
+      try {
+        const api = 'https://zh.wikipedia.org/w/api.php?action=query&list=search&srsearch='
+          + encodeURIComponent(q) + '&format=json&srlimit=3&srprop=snippet';
+        const r = await fetch(api, { headers: { 'User-Agent': 'WorkBuddy-Sync/1.0 (office workspace news)' } });
+        const j = await r.json();
+        const items = (j && j.query && Array.isArray(j.query.search) ? j.query.search : []).map(s => ({
+          title: s.title,
+          snippet: (s.snippet || '').replace(/<[^>]+>/g, ''),
+          url: 'https://zh.wikipedia.org/wiki/' + encodeURIComponent(s.title.replace(/ /g, '_'))
+        }));
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ ok: true, q, items }));
+      } catch (e) {
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ ok: false, q, error: e.message, items: [] }));
+      }
+    })();
+    return;
+  }
+
   // 健康检查
   if (url.pathname === '/health') {
     res.writeHead(200, { 'Content-Type': 'application/json' });
