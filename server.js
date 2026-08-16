@@ -206,20 +206,22 @@ function classify(items) {
 
 // Tavily 兜底。仅读环境变量 TAVILY_API_KEY，不在代码内置任何 key（部署方在 Railway 控制台配置）。
 // Tavily 需 POST + JSON body，GET 会 401
-async function tavilySearch(query) {
+// Tavily 兜底搜索。opts 可覆盖 topic / max_results / days；默认 topic='news'、days=30（用于资讯）。
+async function tavilySearch(query, opts = {}) {
   const KEY = process.env.TAVILY_API_KEY;
   if (!KEY) return [];
   try {
+    const body = {
+      api_key: KEY,
+      query,
+      topic: opts.topic || 'news',
+      max_results: opts.max_results || 3
+    };
+    if (opts.days) body.days = opts.days;
     const r = await fetch('https://api.tavily.com/search', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        api_key: KEY,
-        query,
-        topic: 'news',
-        max_results: 3,
-        days: 30
-      })
+      body: JSON.stringify(body)
     });
     if (!r.ok) throw new Error('HTTP ' + r.status);
     const j = await r.json();
@@ -236,14 +238,44 @@ async function tavilySearch(query) {
   }
 }
 
-// 公司简介：已知客户返回内置简介；未知客户用 Tavily 尽力取一段（≤160 字）
+// 公司简介：已知客户返回内置简介；未知客户用 Tavily 通用网页搜索取一段，并做质量过滤。
+function cleanProfileText(s) {
+  return String(s || '').replace(/\s+/g, ' ').trim();
+}
+function isProfileGarbage(item, q) {
+  const text = cleanProfileText(item.title + ' ' + item.content).toLowerCase();
+  const raw = cleanProfileText(item.content);
+  // 1. 必须提及客户名（去后缀）
+  const core = q.replace(/(股份有限|有限|有限责任|集团|公司)$/g, '').trim();
+  if (!text.includes(q.toLowerCase()) && !text.includes(core.toLowerCase())) return true;
+  // 2. 剔除模板源码 / CMS 占位符
+  if (/\{\{|\}\}|content\.|item\.|columnname|ng-|v-if|v-for|\$\{|template/.test(text)) return true;
+  // 3. 剔除政府指标统计碎片（多个部委名、"预期性"、竖线表格）
+  if (/(国家知识产权局|国家医疗保障局|国务院参事室|国家机关事务管理局|国家国际发展合作署|预期性\s*\||\|\s*\d+\s*\|.*预期性)/.test(text)) return true;
+  // 4. 剔除搜索结果页 / 导航碎片
+  if (/搜索结果|相关结果|site:|首页\s*>/.test(item.title)) return true;
+  // 5. 过短或全是符号
+  if (raw.length < 20 || /^[\s\|\->\{\}\d]+$/.test(raw)) return true;
+  return false;
+}
 async function getProfile(q) {
   if (CLIENT_PROFILES[q]) return CLIENT_PROFILES[q].profile;
   if (!process.env.TAVILY_API_KEY) return '';
-  const r = await tavilySearch(q + ' 公司简介 主营业务 规模');
-  const top = r[0];
-  if (!top) return '';
-  return (top.content || top.snippet || '').replace(/\s+/g, ' ').trim().slice(0, 160);
+  // 用通用网页搜索（非 news），不限制时间，多取几条供质量过滤
+  const queries = [`${q} 公司简介 主营业务`, `${q} 企业简介 经营范围`];
+  const all = [];
+  for (const query of queries) {
+    const res = await tavilySearch(query, { topic: 'general', max_results: 5 });
+    all.push(...res);
+  }
+  const candidates = all.filter(x => !isProfileGarbage(x, q));
+  const best = candidates[0];
+  if (!best) {
+    // 无可信简介时返回兜底，避免展示碎片
+    const suffix = q.includes('公司') ? '' : '公司';
+    return `${q}${suffix}：公开渠道暂未收录可信公司简介，请手动补充或稍后再试。`;
+  }
+  return cleanProfileText(best.content || best.snippet).slice(0, 160);
 }
 
 // 一个客户的 4 个维度：RSS 匹配为主，空维度用 Tavily 补（均做相关性过滤）
