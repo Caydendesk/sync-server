@@ -238,7 +238,52 @@ async function tavilySearch(query, opts = {}) {
   }
 }
 
-// 公司简介：已知客户返回内置简介；未知客户用 Tavily 通用网页搜索取一段，并做质量过滤。
+// Exa 备选搜索（Tavily 为空/失败时降级用）。仅读环境变量 EXA_API_KEY，不在代码内置 key。
+// Exa 用 header `x-api-key` 鉴权；请求 contents.text 拿提取正文（近似 Tavily 的 content 字段）。
+async function exaSearch(query, opts = {}) {
+  const KEY = process.env.EXA_API_KEY;
+  if (!KEY) return [];
+  try {
+    const body = {
+      query,
+      numResults: opts.maxResults || opts.max_results || 5,
+      type: 'keyword',
+      contents: { text: { maxCharacters: 600 } }
+    };
+    const r = await fetch('https://api.exa.ai/search', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'x-api-key': KEY },
+      body: JSON.stringify(body)
+    });
+    if (!r.ok) throw new Error('HTTP ' + r.status);
+    const j = await r.json();
+    return (j.results || []).map(x => ({
+      title: x.title,
+      content: x.text || x.summary || '',
+      snippet: (x.text || x.summary || '').slice(0, 140),
+      url: x.url,
+      source: 'Exa'
+    }));
+  } catch (e) {
+    console.error(`[news] Exa failed for "${query}": ${e.message}`);
+    return [];
+  }
+}
+
+// 统一搜索：先 Tavily（若有 key），为空/失败再 Exa（若有 key）；最终回落由调用方决定（如 RSS）。
+async function searchWebWithFallback(query, opts = {}) {
+  if (process.env.TAVILY_API_KEY) {
+    const t = await tavilySearch(query, { ...opts, max_results: opts.max_results || opts.maxResults || 3 });
+    if (t.length) return t;
+  }
+  if (process.env.EXA_API_KEY) {
+    const e = await exaSearch(query, { ...opts, maxResults: opts.maxResults || opts.max_results || 5 });
+    if (e.length) return e;
+  }
+  return [];
+}
+
+// 公司简介：已知客户返回内置简介；未知客户用通用网页搜索取一段，并做质量过滤（Tavily→Exa 降级）。
 function cleanProfileText(s) {
   return String(s || '').replace(/\s+/g, ' ').trim();
 }
@@ -260,12 +305,12 @@ function isProfileGarbage(item, q) {
 }
 async function getProfile(q) {
   if (CLIENT_PROFILES[q]) return CLIENT_PROFILES[q].profile;
-  if (!process.env.TAVILY_API_KEY) return '';
-  // 用通用网页搜索（非 news），不限制时间，多取几条供质量过滤
+  if (!process.env.TAVILY_API_KEY && !process.env.EXA_API_KEY) return '';
+  // 用通用网页搜索（非 news），多取几条供质量过滤；Tavily 为空自动降级 Exa
   const queries = [`${q} 公司简介 主营业务`, `${q} 企业简介 经营范围`];
   const all = [];
   for (const query of queries) {
-    const res = await tavilySearch(query, { topic: 'general', max_results: 5 });
+    const res = await searchWebWithFallback(query, { topic: 'general', maxResults: 5 });
     all.push(...res);
   }
   const candidates = all.filter(x => !isProfileGarbage(x, q));
@@ -278,20 +323,20 @@ async function getProfile(q) {
   return cleanProfileText(best.content || best.snippet).slice(0, 160);
 }
 
-// 一个客户的 4 个维度：RSS 匹配为主，空维度用 Tavily 补（均做相关性过滤）
+// 一个客户的 4 个维度：RSS 匹配为主，空维度用 Tavily/Exa 补（均做相关性过滤）
 async function searchAllCategories(q) {
   const items = await loadAllRss();
   const matched = matchCustomer(items, q);
   console.log(`[news] 客户「${q}」RSS 命中 ${matched.length} 条`);
   const out = classify(matched);
   let profile = '';
-  if (process.env.TAVILY_API_KEY) {
+  if (process.env.TAVILY_API_KEY || process.env.EXA_API_KEY) {
     // 并行：简介 + 各空维度兜底（兜底结果必须过相关性闸门）
     const profileP = getProfile(q);
     const fillP = CATEGORIES.map(async c => {
       if (!out[c.label].length) {
         const seen = new Set();
-        const r = (await tavilySearch(c.tavily(q)))
+        const r = (await searchWebWithFallback(c.tavily(q)))
           .filter(x => relevantToClient(x, q))
           .filter(x => { if (seen.has(x.url)) return false; seen.add(x.url); return true; });
         out[c.label] = r.slice(0, 3).map(x => ({ title: x.title, snippet: x.snippet, url: x.url, source: x.source }));
@@ -397,5 +442,5 @@ server.listen(PORT, () => {
   console.log(`Sync server running on port ${PORT}`);
   console.log(`Sync endpoint: http://localhost:${PORT}/api/sync`);
   console.log(`News endpoint: http://localhost:${PORT}/api/news`);
-  console.log(`News mode: RSS aggregation${process.env.TAVILY_API_KEY ? ' + Tavily fallback (env var)' : ' (Tavily key not set - only RSS)'}`);
+  console.log(`News mode: RSS aggregation${process.env.TAVILY_API_KEY ? ' + Tavily fallback (env var)' : ' (Tavily key not set - only RSS)'}${process.env.EXA_API_KEY ? ' + Exa fallback (env var)' : ''}`);
 });
