@@ -9,11 +9,20 @@ const path = require('path');
 const PORT = process.env.PORT || 3000;
 const DATA_FILE = path.join(__dirname, 'sync-data.json');
 
-// 读取存储的数据
+// 读取存储的数据。
+// 新版为分桶结构 { [uid]: stateObj }（按同步空间ID隔离）；
+// 旧版扁平 state（顶层直接是 wb_office_* 键）首次读取时自动迁入 'default' 桶，保证已有数据不丢。
 function loadData() {
   try {
     if (fs.existsSync(DATA_FILE)) {
-      return JSON.parse(fs.readFileSync(DATA_FILE, 'utf-8'));
+      const raw = JSON.parse(fs.readFileSync(DATA_FILE, 'utf-8'));
+      if (raw && typeof raw === 'object' && !Array.isArray(raw)) {
+        if (Object.keys(raw).some(k => k.startsWith('wb_office_'))) {
+          // 旧版扁平格式 → 整体迁入 default 桶
+          return { default: raw };
+        }
+        return raw;
+      }
     }
   } catch (e) { console.error('Load error:', e.message); }
   return {};
@@ -287,6 +296,12 @@ async function searchWebWithFallback(query, opts = {}) {
 function cleanProfileText(s) {
   return String(s || '').replace(/\s+/g, ' ').trim();
 }
+function domainOf(url) {
+  try { return new URL(url).hostname.toLowerCase(); } catch (e) { return ''; }
+}
+const JOB_DOMAINS = ['liepin', 'zhipin', 'zhaopin', 'lagou', '51job', 'qcwy', 'boss', 'linkedin', 'job', 'yingjiesheng', 'wenwo', 'kanzhun', 'maimai'];
+const JOB_TOKENS = ['招聘', '简历', '求职', '校招', '猎头', '职位', '单位名片', '人才网', '就业网', '校园招聘', '社会招聘', '投递'];
+
 function isProfileGarbage(item, q) {
   const text = cleanProfileText(item.title + ' ' + item.content).toLowerCase();
   const raw = cleanProfileText(item.content);
@@ -301,8 +316,85 @@ function isProfileGarbage(item, q) {
   if (/搜索结果|相关结果|site:|首页\s*>/.test(item.title)) return true;
   // 5. 过短或全是符号
   if (raw.length < 20 || /^[\s\|\->\{\}\d]+$/.test(raw)) return true;
+  // 6. 导航 soup 判定：菜单词很多且没有一句像样的实体描述
+  const menu = ['关于我们', '公司简介', '组织机构', '公司资质', '公司荣誉', '公司文化', '公司愿景', '新闻资讯', '下载中心', '工程案例', '典型工程', '联系我们', '人才招聘', '产品中心'];
+  const hits = menu.filter(w => text.includes(w)).length;
+  const hasProse = text.split(/[。！？；]/).some(s => s.trim().length >= 25 && /(主营|业务|成立于|是一家|致力于|从事|提供|服务|研发|生产)/.test(s));
+  if (hits >= 4 && !hasProse) return true;
   return false;
 }
+
+// ---- 简介抽取：从候选结果里挑出最像“公司简介”的干净片段 ----
+function isNavSoup(s) {
+  s = cleanProfileText(s);
+  const navTok = ['关注', '已关注', '自选', '添加自选', '首页', '下载', '注册', '登录', '分享', '举报', '隐私', '版权', '关于我们', '公司简介', '组织机构', '联系我们', '选股器', '热力图', '机构追踪'];
+  return navTok.filter(w => s.includes(w)).length >= 3;
+}
+function removeMd(t) {
+  const menu = ['关于我们', '公司简介', '组织机构', '公司资质', '公司荣誉', '公司文化', '公司愿景', '新闻资讯', '下载中心', '工程案例', '典型工程', '联系我们', '人才招聘', '产品中心', '关于金皇', '组织架构', '历史沿革', '企业文化', '资质荣誉', '权属企业', '企业战略', '可持续发展', '加入我们', '自选', '选股器', '添加自选', '热力图', '机构追踪'];
+  t = String(t || '').replace(/[#>*|`]/g, ' ');
+  for (const w of menu) t = t.split(w).join(' ');
+  return cleanProfileText(t);
+}
+function scoreProfile(item, q) {
+  const text = cleanProfileText(item.title + ' ' + item.content).toLowerCase();
+  const url = (item.url || '').toLowerCase();
+  const title = (item.title || '').toLowerCase();
+  const dom = domainOf(item.url);
+  let s = 0;
+  if (/简介|概况|about|公司介绍|企业介绍|profile|intro/.test(title + url)) s += 5;
+  if (/(about|company|intro|profile|corp|gsjj|aboutus)/.test(url)) s += 3;
+  const path = url.includes('//') ? url.split('//')[1].split('/').slice(1).join('/') : '';
+  if (path.length < 3) s -= 4; // 首页
+  if (JOB_DOMAINS.some(d => dom.includes(d))) s -= 12; // 招聘/聚合站强惩
+  if (JOB_TOKENS.some(t => title.includes(t) || text.includes(t))) s -= 5;
+  if (/(news|article|\/202\d|报道|资讯|召开|宣布|到位|亮相|揭牌|签约|消息|动态)/.test(url + title)) s -= 4; // 新闻稿降权
+  const menu = ['关于我们', '公司简介', '组织机构', '公司资质', '公司荣誉', '公司文化', '公司愿景', '新闻资讯', '下载中心', '工程案例', '典型工程', '联系我们'];
+  const hits = menu.filter(w => text.includes(w)).length;
+  if (hits >= 4) s -= 3;
+  if (/(主营|业务涵盖|成立于|是一家|致力于|从事|提供.*服务|生产.*产品)/.test(text)) s += 2;
+  return s;
+}
+function extractProfileSentence(text, q) {
+  let t = removeMd(text);
+  const core = q.replace(/(股份有限|有限|有限责任|集团|公司)$/g, '').trim();
+  const needles = [q, core].filter(Boolean);
+  const signal = /（?(?:成立|注册资本|位于|主营|经营范围|业务涵盖|是一家|致力于|主要从事|从事|提供|研发|生产|经[^，。]{0,12}批准|控股|旗下)/;
+  let bestIdx = -1, bestDist = 1e9;
+  for (const n of needles) {
+    let idx = t.indexOf(n);
+    while (idx !== -1) {
+      const after = t.slice(idx + Math.min(n.length, t.length - idx));
+      const mm = after.slice(0, 60).match(signal);
+      if (mm && mm.index < bestDist) { bestDist = mm.index; bestIdx = idx; }
+      idx = t.indexOf(n, idx + n.length);
+    }
+  }
+  let seg = '';
+  if (bestIdx !== -1) {
+    const from = t.slice(bestIdx);
+    const m = from.match(/^.{0,200}?[，。]/);
+    seg = m ? from.slice(0, m[0].length - 1) : from.slice(0, 160);
+  } else {
+    const sentences = t.split(/[，,。！？\n;；]/).map(s => s.trim()).filter(s => s.length > 12);
+    seg = sentences.find(s => (s.includes(q) || s.includes(core)) && !isNavSoup(s)) || '';
+  }
+  seg = seg.replace(/^(企业概况|ABOUT|公司做什么|企业介绍|公司简介)[\s:：]*/i, '')
+           .replace(/^([^，。]{1,14})\s*\([^)]{1,20}\)\s*(公司做什么\s*)?/, '$1 ')
+           .replace(/^[\s:：]+/, '');
+  return cleanProfileText(seg).slice(0, 160);
+}
+function pickBestProfile(cands, q) {
+  cands = cands.slice().sort((a, b) => scoreProfile(b, q) - scoreProfile(a, q));
+  for (const c of cands) {
+    const frag = extractProfileSentence(c.content || c.snippet, q);
+    if (frag && !isNavSoup(frag) && (frag.includes(q) || /简介|主营|业务|成立|是一家|致力于|从事|提供|研发|生产|注册资本|位于/.test(frag)))
+      return frag;
+  }
+  const top = cands[0];
+  return cleanProfileText((top.content || top.snippet) || '').slice(0, 160);
+}
+
 async function getProfile(q) {
   if (CLIENT_PROFILES[q]) return CLIENT_PROFILES[q].profile;
   if (!process.env.TAVILY_API_KEY && !process.env.EXA_API_KEY) return '';
@@ -310,17 +402,16 @@ async function getProfile(q) {
   const queries = [`${q} 公司简介 主营业务`, `${q} 企业简介 经营范围`];
   const all = [];
   for (const query of queries) {
-    const res = await searchWebWithFallback(query, { topic: 'general', maxResults: 5 });
+    const res = await searchWebWithFallback(query, { topic: 'general', maxResults: 8 });
     all.push(...res);
   }
   const candidates = all.filter(x => !isProfileGarbage(x, q));
-  const best = candidates[0];
-  if (!best) {
+  if (!candidates.length) {
     // 无可信简介时返回兜底，避免展示碎片
     const suffix = q.includes('公司') ? '' : '公司';
     return `${q}${suffix}：公开渠道暂未收录可信公司简介，请手动补充或稍后再试。`;
   }
-  return cleanProfileText(best.content || best.snippet).slice(0, 160);
+  return pickBestProfile(candidates, q);
 }
 
 // 一个客户的 4 个维度：RSS 匹配为主，空维度用 Tavily/Exa 补（均做相关性过滤）
@@ -366,19 +457,22 @@ const server = http.createServer((req, res) => {
   const url = new URL(req.url, `http://${req.headers.host}`);
 
   if (url.pathname === '/api/sync') {
+    // uid = 同步空间ID，未传则归入 'default' 桶（保持单人现状兼容）
+    const uid = url.searchParams.get('uid') || 'default';
     if (req.method === 'GET') {
-      // 拉取数据
+      // 拉取数据（仅该空间的数据）
       const data = loadData();
       res.writeHead(200, { 'Content-Type': 'application/json' });
-      res.end(JSON.stringify({ ok: true, data }));
+      res.end(JSON.stringify({ ok: true, uid, data: data[uid] || {} }));
     } else if (req.method === 'PUT') {
-      // 推送数据（时间戳合并策略）
+      // 推送数据（时间戳合并策略，按空间隔离）
       let body = '';
       req.on('data', chunk => { body += chunk; });
       req.on('end', () => {
         try {
           const incoming = JSON.parse(body);
-          const existing = loadData();
+          const all = loadData();
+          const existing = all[uid] || {};
 
           // 合并：每个 key 保留 _lastModified 更大的那份
           for (const key of Object.keys(incoming)) {
@@ -390,9 +484,10 @@ const server = http.createServer((req, res) => {
             }
           }
 
-          saveData(existing);
+          all[uid] = existing;
+          saveData(all);
           res.writeHead(200, { 'Content-Type': 'application/json' });
-          res.end(JSON.stringify({ ok: true }));
+          res.end(JSON.stringify({ ok: true, uid }));
         } catch (e) {
           res.writeHead(400, { 'Content-Type': 'application/json' });
           res.end(JSON.stringify({ ok: false, error: e.message }));
