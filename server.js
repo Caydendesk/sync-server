@@ -36,9 +36,10 @@ function saveData(data) {
 }
 
 /* =========================================================
- * 客户资讯：RSS 为主 + Tavily 免费层兜底
+ * 客户资讯：RSS 为主 + 联网搜索兜底
  *  - 主通道：聚合公开 RSS 新闻源，按【客户名称】模糊匹配，按 4 维度分类
- *  - 兜底：  若配置 TAVILY_API_KEY，对 RSS 未覆盖到的维度用 Tavily 新闻搜索补全
+ *  - 兜底（回落链）：腾讯云联网搜索 WSA（若有 key）→ Tavily（若有 key）→ Exa（若有 key）
+ *    WSA 即“元宝联网搜索 MCP”底层（腾讯云 Web Search API，搜狗引擎），全部仅读环境变量，不内置 key
  *  - 每次刷新都重新匹配（源内容缓存 10 分钟，源本身更新即视为新）
  *  4 个维度：项目建设 / 股权投融资 / 高层管理人动态 / 所在行业政策
  * ======================================================= */
@@ -279,8 +280,65 @@ async function exaSearch(query, opts = {}) {
   }
 }
 
-// 统一搜索：先 Tavily（若有 key），为空/失败再 Exa（若有 key）；最终回落由调用方决定（如 RSS）。
+// 腾讯云联网搜索 API（wsa，底层搜狗，兼容“元宝联网搜索 MCP”）。
+// 服务 API KEY 方式：Header `Authorization: Bearer <KEY>`，域名 api.wsa.cloud.tencent.com，POST /SearchPro。
+// 仅读环境变量 TENCENT_WSA_API_KEY，不在代码内置 key（部署方在 Railway 控制台配置）。
+// 响应结构：{ Response: { Pages: [ "{\"passage\":..,\"title\":..,\"url\":..,\"score\":..}"(JSON 字符串), ... ] } }
+async function wsaSearch(query, opts = {}) {
+  const KEY = process.env.TENCENT_WSA_API_KEY;
+  if (!KEY) return [];
+  try {
+    const body = {
+      Query: query,
+      Mode: opts.mode != null ? opts.mode : 0
+    };
+    // Cnt 仅支持枚举 10/20/30/40/50，且为尊享版/旗舰版专属参数；非枚举值会报 illegal Cnt。
+    // 故默认不传（用 API 默认条数），仅在显式传入合法枚举值时才带上。
+    const cnt = opts.cnt || opts.maxResults || opts.max_results;
+    if (cnt && [10, 20, 30, 40, 50].includes(Number(cnt))) body.Cnt = Number(cnt);
+    if (opts.site) body.Site = opts.site;
+    const r = await fetch('https://api.wsa.cloud.tencent.com/SearchPro', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json; charset=UTF-8',
+        'Authorization': 'Bearer ' + KEY
+      },
+      body: JSON.stringify(body)
+    });
+    if (!r.ok) throw new Error('HTTP ' + r.status);
+    const j = await r.json();
+    const resp = j.Response || {};
+    if (resp.Error) throw new Error(resp.Error.Message || resp.Error.Code || 'WSA Error');
+    const pages = resp.Pages || resp.Results || [];
+    const out = [];
+    for (const p of pages) {
+      let item;
+      try { item = typeof p === 'string' ? JSON.parse(p) : p; } catch (e) { continue; }
+      const passage = stripTags(item.passage || item.content || '');
+      if (!item.title && !passage) continue;
+      out.push({
+        title: item.title || '',
+        content: passage,
+        snippet: passage.slice(0, 140),
+        url: item.url || '',
+        date: item.date || '',
+        source: '腾讯搜索'
+      });
+    }
+    return out;
+  } catch (e) {
+    console.error(`[news] WSA failed for "${query}": ${e.message}`);
+    return [];
+  }
+}
+
+// 统一搜索：先 WSA（腾讯云联网搜索，若有 key），为空/失败再 Tavily（若有 key），再 Exa（若有 key）；
+// 最终回落由调用方决定（如 RSS）。
 async function searchWebWithFallback(query, opts = {}) {
+  if (process.env.TENCENT_WSA_API_KEY) {
+    const w = await wsaSearch(query, { ...opts, cnt: opts.maxResults || opts.max_results || 8 });
+    if (w.length) return w;
+  }
   if (process.env.TAVILY_API_KEY) {
     const t = await tavilySearch(query, { ...opts, max_results: opts.max_results || opts.maxResults || 3 });
     if (t.length) return t;
@@ -397,7 +455,7 @@ function pickBestProfile(cands, q) {
 
 async function getProfile(q) {
   if (CLIENT_PROFILES[q]) return CLIENT_PROFILES[q].profile;
-  if (!process.env.TAVILY_API_KEY && !process.env.EXA_API_KEY) return '';
+  if (!process.env.TAVILY_API_KEY && !process.env.EXA_API_KEY && !process.env.TENCENT_WSA_API_KEY) return '';
   // 用通用网页搜索（非 news），多取几条供质量过滤；Tavily 为空自动降级 Exa
   const queries = [`${q} 公司简介 主营业务`, `${q} 企业简介 经营范围`];
   const all = [];
@@ -421,7 +479,7 @@ async function searchAllCategories(q) {
   console.log(`[news] 客户「${q}」RSS 命中 ${matched.length} 条`);
   const out = classify(matched);
   let profile = '';
-  if (process.env.TAVILY_API_KEY || process.env.EXA_API_KEY) {
+  if (process.env.TAVILY_API_KEY || process.env.EXA_API_KEY || process.env.TENCENT_WSA_API_KEY) {
     // 并行：简介 + 各空维度兜底（兜底结果必须过相关性闸门）
     const profileP = getProfile(q);
     const fillP = CATEGORIES.map(async c => {
@@ -537,5 +595,5 @@ server.listen(PORT, () => {
   console.log(`Sync server running on port ${PORT}`);
   console.log(`Sync endpoint: http://localhost:${PORT}/api/sync`);
   console.log(`News endpoint: http://localhost:${PORT}/api/news`);
-  console.log(`News mode: RSS aggregation${process.env.TAVILY_API_KEY ? ' + Tavily fallback (env var)' : ' (Tavily key not set - only RSS)'}${process.env.EXA_API_KEY ? ' + Exa fallback (env var)' : ''}`);
+  console.log(`News mode: RSS aggregation${process.env.TENCENT_WSA_API_KEY ? ' + 腾讯云联网搜索WSA (env var)' : ''}${process.env.TAVILY_API_KEY ? ' + Tavily fallback (env var)' : ''}${process.env.EXA_API_KEY ? ' + Exa fallback (env var)' : ''}`);
 });
