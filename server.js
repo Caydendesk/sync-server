@@ -7,7 +7,10 @@ const fs = require('fs');
 const path = require('path');
 
 const PORT = process.env.PORT || 3000;
-const DATA_FILE = path.join(__dirname, 'sync-data.json');
+// 数据文件位置：默认写在代码目录（Railway/本地），CloudBase 等容器平台挂持久卷时
+// 通过环境变量 DATA_DIR 指向挂载点（如 /data），避免容器文件系统重置导致数据丢失。
+const DATA_DIR = process.env.DATA_DIR || __dirname;
+const DATA_FILE = path.join(DATA_DIR, 'sync-data.json');
 
 // 读取存储的数据。
 // 新版为分桶结构 { [uid]: stateObj }（按同步空间ID隔离）；
@@ -31,6 +34,8 @@ function loadData() {
 // 保存数据
 function saveData(data) {
   try {
+    // 确保数据目录存在（挂载点首次为空或异常路径时也能正常落盘）
+    fs.mkdirSync(path.dirname(DATA_FILE), { recursive: true });
     fs.writeFileSync(DATA_FILE, JSON.stringify(data, null, 2), 'utf-8');
   } catch (e) { console.error('Save error:', e.message); }
 }
@@ -473,6 +478,23 @@ async function getProfile(q) {
 }
 
 // 一个客户的 4 个维度：RSS 匹配为主，空维度用 Tavily/Exa 补（均做相关性过滤）
+// 资讯结果内存缓存：按客户名缓存，TTL 20 分钟。
+// 个人工具客户就那几个、反复刷新，缓存可省下大量 WSA/Tavily 调用额度并秒回。
+// 注意：这是进程内缓存，容器冷启动（缩容到0后重建）会清空，属可接受代价。
+const NEWS_CACHE = new Map();
+const NEWS_CACHE_TTL = 20 * 60 * 1000;
+async function getNewsCached(q) {
+  const key = q;
+  const hit = NEWS_CACHE.get(key);
+  if (hit && (Date.now() - hit.t < NEWS_CACHE_TTL)) {
+    console.log(`[news] 命中缓存「${q}」`);
+    return { ...hit.v, cached: true };
+  }
+  const v = await searchAllCategories(q);
+  NEWS_CACHE.set(key, { t: Date.now(), v });
+  return { ...v, cached: false };
+}
+
 async function searchAllCategories(q) {
   const items = await loadAllRss();
   const matched = matchCustomer(items, q);
@@ -569,9 +591,9 @@ const server = http.createServer((req, res) => {
     }
     (async () => {
       try {
-        const result = await searchAllCategories(q);
+        const result = await getNewsCached(q);
         res.writeHead(200, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({ ok: true, q, updatedAt: Date.now(), profile: result.profile, found: result.found, categories: result.categories }));
+        res.end(JSON.stringify({ ok: true, q, updatedAt: Date.now(), profile: result.profile, found: result.found, categories: result.categories, cached: result.cached }));
       } catch (e) {
         res.writeHead(200, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify({ ok: false, q, error: e.message, profile: '', found: false, categories: {} }));
